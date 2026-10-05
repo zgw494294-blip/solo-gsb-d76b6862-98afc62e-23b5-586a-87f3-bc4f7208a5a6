@@ -326,6 +326,32 @@ button.small { padding: 3px 10px; font-size: 12px; }
 .verify-ok { color: var(--green); font-size: 13px; }
 .verify-wait { color: var(--muted); font-size: 13px; }
 
+/* ---------- 自动发出 ---------- */
+.auto-controls {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin: 4px 0 10px;
+}
+.auto-interval-label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 13px;
+  white-space: nowrap;
+}
+.auto-interval-label input {
+  width: 72px;
+  padding: 6px 8px;
+  font-size: 14px;
+}
+.auto-status { font-size: 13px; }
+.auto-status.on { color: var(--green); }
+.auto-status.off { color: var(--muted); }
+.auto-status.paused, .auto-status.waiting { color: var(--accent); }
+
 .issue-edit {
   display: flex;
   align-items: center;

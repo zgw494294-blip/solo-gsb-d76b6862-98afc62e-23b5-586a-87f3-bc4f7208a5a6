@@ -184,6 +184,8 @@ function updateBusy() {
   // 不随控制资格禁用（回报无需凭据）。开场 /api/setup 成功后 renderVerify
   // 在 busy 仍为 true 时渲染，全靠这里把按钮恢复为可点。
   updateVerifyButtons();
+  // 自动发出的开关 / 设置按钮与间隔输入：随在途请求与控制资格同步
+  updateAutoButtons();
 }
 
 /* 页头控制席标记：未启用 / 本页控制 / 他人控制（本页只读，可接管）。 */
@@ -801,6 +803,149 @@ function reportVerify(dept) {
   });
 }
 
+/* ---------------------------------------------------------------- 自动发出
+ * 服务端后台按统一间隔自动发出当前提示：开启/改间隔后从完整间隔计时，暂停冻结
+ * 剩余时间、恢复续计，到期未就绪（核验门槛）继续等；手工确认/撤回/改写当前/
+ * 重排换头重新计时，队首不变的重排与编辑其他提示不重置。设置经 POST /api/auto
+ * （携带版本号、受控制席保护，成功版本 +1）。发出在服务端进行，无需页面保持
+ * 打开；页面每秒轮询（pollState）同步进度、剩余秒数或等待就绪。 */
+
+/* 服务端状态中的自动发出视图；旧服务端/异常响应缺该字段时按关闭处理。 */
+function autoState() {
+  const a = state && state.auto;
+  return a && typeof a === "object"
+    ? a
+    : { enabled: false, interval: 10, remaining_seconds: null, waiting_ready: false };
+}
+
+/* 状态行文案：关闭 / 倒计时剩余秒数 / 暂停冻结 / 等待就绪。 */
+function autoStatusView() {
+  const a = autoState();
+  if (!a.enabled) return { cls: "off", text: "已关闭：手工确认发出" };
+  const secs = a.remaining_seconds === null || a.remaining_seconds === undefined
+    ? null : Math.max(0, Math.ceil(a.remaining_seconds));
+  if (state.paused) {
+    return { cls: "paused",
+      text: `已暂停 · 恢复后续计（剩余约 ${secs === null ? "—" : secs + " 秒"}）` };
+  }
+  if (a.waiting_ready) return { cls: "waiting", text: "已到间隔 · 等待灯光、音响就绪…" };
+  if (secs === null) return { cls: "on", text: "自动发出已开启" };
+  return { cls: "on", text: secs > 0 ? `约 ${secs} 秒后自动发出当前提示` : "即将自动发出…" };
+}
+
+/* 演出页的自动发出卡片：开关、间隔设置与状态行。整体重建仅在版本变化或
+ * 操作后发生；秒数流逝等轻量更新走 updateAutoDynamic，不打断正在输入的间隔。 */
+function renderAuto() {
+  const card = $("#auto-card");
+  if (!card) return;
+  if (!state || state.status === "setup") {
+    card.classList.add("hidden");
+    card.innerHTML = "";
+    return;
+  }
+  card.classList.remove("hidden");
+  const a = autoState();
+  card.innerHTML = `
+    <div class="card-label">自动发出 · 统一间隔</div>
+    <div class="auto-controls">
+      <label class="auto-interval-label">间隔
+        <input id="auto-interval" type="number" min="1" max="60" step="1"
+          value="${a.interval}" aria-label="自动间隔（秒）">
+        秒
+      </label>
+      <button id="auto-apply" class="small" data-action="auto-apply">设置间隔</button>
+      <button id="auto-toggle" class="small" data-action="auto-toggle"></button>
+    </div>
+    <div id="auto-status" class="auto-status"></div>`;
+  updateAutoDynamic();
+}
+
+/* 轻量更新：状态行、开关按钮与间隔输入框（输入框聚焦时不覆盖页面上的值）。
+ * 轮询到同版本状态、或请求结束后都会走到这里。 */
+function updateAutoDynamic() {
+  const card = $("#auto-card");
+  if (!card || card.classList.contains("hidden")) return;
+  const a = autoState();
+  const view = autoStatusView();
+  const statusEl = $("#auto-status", card);
+  if (statusEl) {
+    statusEl.textContent = view.text;
+    statusEl.className = "auto-status " + view.cls;
+  }
+  const toggle = $("#auto-toggle", card);
+  if (toggle) {
+    toggle.textContent = a.enabled ? "关闭自动 ⏹" : "开启自动 ▶";
+    toggle.classList.toggle("primary", !a.enabled);
+  }
+  const input = $("#auto-interval", card);
+  if (input && document.activeElement !== input) input.value = a.interval;
+  updateAutoButtons();
+}
+
+/* 开关 / 设置按钮与间隔输入的可用性：请求在途、非控制席或非演出中禁用
+ * （服务端同样拒绝）；与其他写入口一样随 busy 与资格同步。 */
+function updateAutoButtons() {
+  const card = $("#auto-card");
+  if (!card || card.classList.contains("hidden")) return;
+  const usable = !busy && canWrite() && !!state && state.status === "live";
+  const toggle = $("#auto-toggle", card);
+  if (toggle) toggle.disabled = !usable;
+  const apply = $("#auto-apply", card);
+  if (apply) apply.disabled = !usable;
+  const input = $("#auto-interval", card);
+  if (input) input.disabled = !usable;
+}
+
+/* 读取间隔输入框：1～60 的整数才合法，否则提示并返回 null（不发请求）。 */
+function readAutoInterval() {
+  const card = $("#auto-card");
+  const input = card ? $("#auto-interval", card) : null;
+  const value = input ? Number(input.value) : NaN;
+  if (!Number.isInteger(value) || value < 1 || value > 60) {
+    toast("自动间隔须为 1～60 秒的整数");
+    if (input) input.focus();
+    return null;
+  }
+  return value;
+}
+
+/* 每秒轮询同步进度：自动发出在服务端后台进行，页面据此刷新已发记录、版本号
+ * 与倒计时。轮询是纯查询（GET /api/state），不改变任何状态；有写请求在途时
+ * 跳过本次，避免旧响应覆盖写操作带回的最新状态。 */
+async function pollState() {
+  if (busy || !state) return;
+  let s;
+  try {
+    const headers = {};
+    if (controlToken) headers["X-Control-Token"] = controlToken;
+    const res = await fetch("/api/state", { headers });
+    if (!res.ok) return;
+    s = await res.json();
+  } catch (err) {
+    return; // 网络抖动：下次轮询再试
+  }
+  if (busy) return; // 轮询在途时页面发起了写操作：写响应会带回最新状态
+  if (s.version < state.version) return; // 更旧的轮询响应迟到：丢弃，不回退状态
+  const editing = editingId !== null || editingIssueId !== null;
+  if (s.version === state.version || editing) {
+    /* 版本未变（仅时间流逝或资格变化），或正在编辑/记问题：只同步数据与
+     * 轻量显示（自动卡片、控制席标记、版本角标），不重建页面——避免打断
+     * 正在输入的内容；编辑保存时若已过期会按 409 统一处理。 */
+    state = s;
+    if (typeof s.control_granted === "boolean") {
+      controlGranted = s.control_granted;
+      if (s.control_enabled && !s.control_granted && controlToken) {
+        saveControlToken(null);
+      }
+    }
+    renderControl();
+    updateAutoDynamic();
+    $("#version-badge").textContent = "v" + s.version;
+    return;
+  }
+  applyState(s); // 版本变化（含后台自动发出）：整体刷新
+}
+
 /* ---------------------------------------------------------------- 渲染 */
 
 function render() {
@@ -811,6 +956,7 @@ function render() {
   const inSetup = state.status === "setup";
   $("#setup-view").classList.toggle("hidden", !inSetup);
   $("#live-view").classList.toggle("hidden", inSetup);
+  renderAuto(); // 自动发出卡片：开场前隐藏，演出页显示开关与倒计时
   if (inSetup) {
     // 从演出中/完成回到开场前（开始前加载、重置或归档成功）时清空旧录入
     if (prevStatus !== "setup") resetSetupRows();
@@ -1061,6 +1207,20 @@ document.addEventListener("click", (e) => {
     // 工种就绪回报：无需控制凭据（缺失/失效凭据也不 403），只读页面也可提交；
     // 本页缓存的凭据由 apiHeaders 自动随请求提交，供服务端回报本页资格
     reportVerify(btn.dataset.dept);
+  } else if (action === "auto-toggle") {
+    // 开关自动发出：开启时提交输入框中的间隔；关闭保留已设间隔
+    if (autoState().enabled) {
+      api("/api/auto", { version: state.version, enabled: false });
+    } else {
+      const interval = readAutoInterval();
+      if (interval === null) return;
+      api("/api/auto", { version: state.version, enabled: true, interval });
+    }
+  } else if (action === "auto-apply") {
+    // 设置间隔：开启中改间隔会从完整间隔重新计时（服务端规则）
+    const interval = readAutoInterval();
+    if (interval === null) return;
+    api("/api/auto", { version: state.version, enabled: autoState().enabled, interval });
   }
 });
 
@@ -1207,3 +1367,9 @@ $("#archives-body").addEventListener("keydown", (e) => {
     toast("无法连接服务端：" + err.message);
   }
 })();
+
+/* 自动发出在服务端后台计时：页面打开期间每秒轮询同步进度与倒计时（纯查询），
+ * 页面关闭不影响发出。测试环境无 setInterval 时不启动轮询。 */
+if (typeof setInterval === "function") {
+  setInterval(pollState, 1000);
+}

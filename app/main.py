@@ -35,15 +35,26 @@ control_granted 一律按本次凭据如实回报（凭据永不泄露），当�
 不可复用）；编辑其他提示、暂停恢复、接管不清空。轮次与就绪记录随数据库持久化
 （刷新、重启保留）；归档或重置会关闭核验并清空轮次与就绪，下一场不继承，档案
 结构不变。核验关闭时所有旧接口行为不变。
+
+自动发出：默认关闭。演出中可经 POST /api/auto 设置统一间隔（1～60 秒整数）
+与开关（携带版本号、受控制席保护，成功版本 +1；非演出中或版本过期 409，
+非法间隔 400）。开启或改间隔后从完整间隔重新计时；服务端后台任务在同一
+写锁内重新核对开关、演出状态、暂停标记、计时到期与两工种就绪后才发出
+一条（沿用手工确认的快照、版本推进与换轮规则，不补发积压），无需页面
+保持打开。暂停冻结剩余时间、恢复续计；到期未就绪继续等。手工确认、撤回、
+改写当前提示或重排换头都会重新计时；队首不变的重排与编辑其他提示不重置。
+接管、归档、重置、完成或服务重启都会关闭自动模式；写入失败整体回滚，
+不推进、不重置计时、不改版本。
 """
 import json
 import os
 import secrets
 import sqlite3
 import threading
+import time
 from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Any, Optional
 
 from fastapi import FastAPI, Header
 from fastapi.responses import JSONResponse
@@ -61,8 +72,24 @@ ISSUE_MAX_LEN = 200
 # 本场核验工种：灯光 / 音响（API 使用稳定英文键，页面显示中文名）
 VERIFY_DEPARTMENTS = ("lighting", "sound")
 
+# 自动发出：统一间隔的合法范围（秒，缺省 10 见 meta.auto_interval 列默认值）；
+# 后台任务的唤醒周期
+AUTO_MIN_INTERVAL = 1
+AUTO_MAX_INTERVAL = 60
+AUTO_POLL_SECONDS = 0.2
+
 # 串行化所有写操作，保证版本检查与落库是原子的。
 lock = threading.Lock()
+
+
+def _clock() -> float:
+    """自动计时使用的当前时间（epoch 秒）。
+
+    与记录用的 datetime.now 分开：计时走这个可替换的时钟，回归测试用可控
+    时钟精确驱动"等满间隔 / 暂停冻结 / 到期未就绪"等交错场景；生产环境
+    即真实时间。
+    """
+    return time.time()
 
 
 def _connect() -> sqlite3.Connection:
@@ -100,7 +127,11 @@ def init_db() -> None:
                 control_enabled INTEGER NOT NULL DEFAULT 0,  -- 是否启用单控制席
                 control_token   TEXT,                   -- 当前控制席凭据（未启用为 NULL）
                 verify_enabled  INTEGER NOT NULL DEFAULT 0,  -- 是否启用本场核验
-                verify_round    INTEGER NOT NULL DEFAULT 0   -- 当前核验轮次（单调递增）
+                verify_round    INTEGER NOT NULL DEFAULT 0,  -- 当前核验轮次（单调递增）
+                auto_enabled    INTEGER NOT NULL DEFAULT 0,  -- 是否开启自动发出
+                auto_interval   INTEGER NOT NULL DEFAULT 10, -- 统一间隔（秒，1～60）
+                auto_deadline   REAL,     -- 当前提示到期时刻（epoch 秒）；暂停/关闭为 NULL
+                auto_remaining  REAL      -- 暂停时冻结的剩余秒数；未暂停为 NULL
             );
             CREATE TABLE IF NOT EXISTS cues (
                 id             INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -166,6 +197,20 @@ def init_db() -> None:
             conn.execute(
                 "ALTER TABLE meta ADD COLUMN verify_round INTEGER NOT NULL DEFAULT 0"
             )
+        # 旧库升级：meta 表缺少自动发出列时补上，已有数据默认关闭、间隔取缺省值。
+        if "auto_enabled" not in columns:
+            conn.execute(
+                "ALTER TABLE meta ADD COLUMN auto_enabled INTEGER NOT NULL DEFAULT 0"
+            )
+        if "auto_interval" not in columns:
+            conn.execute(
+                "ALTER TABLE meta ADD COLUMN auto_interval "
+                "INTEGER NOT NULL DEFAULT 10"
+            )
+        if "auto_deadline" not in columns:
+            conn.execute("ALTER TABLE meta ADD COLUMN auto_deadline REAL")
+        if "auto_remaining" not in columns:
+            conn.execute("ALTER TABLE meta ADD COLUMN auto_remaining REAL")
         # 旧库升级：archives 表缺少 issues 列时补上，旧档案默认无问题记录。
         archive_columns = {
             r["name"] for r in conn.execute("PRAGMA table_info(archives)")
@@ -245,6 +290,206 @@ def verify_close(conn: sqlite3.Connection) -> None:
     )
 
 
+# ---------------------------------------------------------------- 自动发出
+
+def auto_view(meta: sqlite3.Row, all_ready: bool) -> dict:
+    """自动发出视图：开关、间隔、剩余秒数或"等待就绪"标记。
+
+    剩余秒数：未暂停时为到期时刻减去当前时间（冻结前不为负）；暂停时为
+    冻结的剩余时间。到期而核验门槛未满足时 waiting_ready 为 True（继续等，
+    不重置计时）。关闭时剩余秒数为 None，旧客户端可整体忽略该字段。
+    """
+    enabled = bool(meta["auto_enabled"])
+    remaining = None
+    waiting_ready = False
+    if enabled:
+        if meta["paused"]:
+            frozen = meta["auto_remaining"]
+            remaining = max(0.0, frozen) if frozen is not None else None
+        elif meta["auto_deadline"] is not None:
+            remaining = max(0.0, meta["auto_deadline"] - _clock())
+            if (
+                remaining <= 0
+                and meta["verify_enabled"]
+                and not all_ready
+            ):
+                waiting_ready = True
+    return {
+        "enabled": enabled,
+        "interval": meta["auto_interval"],
+        "remaining_seconds": round(remaining, 1) if remaining is not None else None,
+        "waiting_ready": waiting_ready,
+    }
+
+
+def auto_restart_timer(conn: sqlite3.Connection) -> None:
+    """当前提示更换（或开启 / 改间隔）后重新计时：从完整间隔计起。
+
+    仅自动模式开启时有效；暂停中改为冻结完整间隔的剩余时间，恢复后续计。
+    必须在写锁内、与触发它的业务写入同一事务内调用。
+    """
+    meta = conn.execute(
+        "SELECT auto_enabled, auto_interval, paused FROM meta WHERE id = 1"
+    ).fetchone()
+    if not meta["auto_enabled"]:
+        return
+    if meta["paused"]:
+        conn.execute(
+            "UPDATE meta SET auto_deadline = NULL, auto_remaining = ? WHERE id = 1",
+            (float(meta["auto_interval"]),),
+        )
+    else:
+        conn.execute(
+            "UPDATE meta SET auto_deadline = ?, auto_remaining = NULL WHERE id = 1",
+            (_clock() + meta["auto_interval"],),
+        )
+
+
+def auto_freeze(conn: sqlite3.Connection) -> None:
+    """暂停发出：冻结剩余时间（到期时刻 -> 剩余秒数）。与暂停写入同一事务。"""
+    meta = conn.execute(
+        "SELECT auto_enabled, auto_deadline FROM meta WHERE id = 1"
+    ).fetchone()
+    if not meta["auto_enabled"] or meta["auto_deadline"] is None:
+        return
+    remaining = max(0.0, meta["auto_deadline"] - _clock())
+    conn.execute(
+        "UPDATE meta SET auto_deadline = NULL, auto_remaining = ? WHERE id = 1",
+        (remaining,),
+    )
+
+
+def auto_thaw(conn: sqlite3.Connection) -> None:
+    """恢复发出：按冻结的剩余时间续计（剩余秒数 -> 到期时刻）。同事务。"""
+    meta = conn.execute(
+        "SELECT auto_enabled, auto_remaining FROM meta WHERE id = 1"
+    ).fetchone()
+    if not meta["auto_enabled"] or meta["auto_remaining"] is None:
+        return
+    conn.execute(
+        "UPDATE meta SET auto_deadline = ?, auto_remaining = NULL WHERE id = 1",
+        (_clock() + meta["auto_remaining"],),
+    )
+
+
+def auto_disable(conn: sqlite3.Connection) -> None:
+    """关闭自动模式并清空计时（接管 / 归档 / 重置 / 完成 / 服务重启）。
+
+    保留已设间隔，便于下一场再次开启时沿用。与触发它的写入同一事务。
+    仅在确实开启或留有计时时才落 UPDATE：已关闭时不触碰 meta 行。
+    """
+    conn.execute(
+        "UPDATE meta SET auto_enabled = 0, auto_deadline = NULL, "
+        "auto_remaining = NULL WHERE id = 1 AND (auto_enabled != 0 "
+        "OR auto_deadline IS NOT NULL OR auto_remaining IS NOT NULL)"
+    )
+
+
+def auto_tick() -> bool:
+    """后台定时任务：当前提示等满间隔且就绪门槛满足时自动发出一条。
+
+    与手工操作共用同一把写锁：执行时重新核对自动开关、演出状态、暂停标记、
+    计时到期与两工种就绪，任一不满足即不发出——与手工确认竞争时，要么手工
+    先生效（计时被重置，本次到期检查自然落空），要么自动先发出（手工确认
+    因版本过期被 409 拒绝），不会重复发出或跳条。发出沿用手工确认的内容
+    快照、版本推进与换轮规则；每次最多一条，下一条从完整间隔重新计时，
+    不补发积压。到期未就绪（核验门槛未满足）则继续等，不重置计时。
+    返回本次是否发出了提示。
+    """
+    with lock, db() as conn:
+        meta = conn.execute(
+            "SELECT version, status, paused, verify_enabled, verify_round, "
+            "auto_enabled, auto_interval, auto_deadline FROM meta WHERE id = 1"
+        ).fetchone()
+        if (
+            not meta["auto_enabled"]
+            or meta["status"] != "live"
+            or meta["paused"]
+            or meta["auto_deadline"] is None
+        ):
+            return False
+        now = _clock()
+        if now < meta["auto_deadline"]:
+            return False  # 未到期
+        if meta["verify_enabled"]:
+            ready_count = conn.execute(
+                "SELECT COUNT(*) AS c FROM verify_reports "
+                "WHERE round = ? AND ready = 1",
+                (meta["verify_round"],),
+            ).fetchone()["c"]
+            if ready_count < len(VERIFY_DEPARTMENTS):
+                return False  # 到期未就绪：继续等，不重置计时
+        row = conn.execute(
+            "SELECT * FROM cues WHERE status = 'pending' "
+            "ORDER BY position ASC, id ASC LIMIT 1"
+        ).fetchone()
+        if row is None:
+            return False
+
+        new_version = meta["version"] + 1
+        now_iso = datetime.now(timezone.utc).isoformat()
+        conn.execute(
+            "UPDATE cues SET status = 'issued', issued_content = content, "
+            "issued_at = ?, issued_seq = ? WHERE id = ?",
+            (now_iso, new_version, row["id"]),
+        )
+        remaining = conn.execute(
+            "SELECT COUNT(*) AS c FROM cues WHERE status = 'pending'"
+        ).fetchone()["c"]
+        # 与手工确认一致：推进即开启新轮次并清空本轮就绪（同一事务）
+        verify_advance(conn)
+        if remaining == 0:
+            # 全部发出：完成并关闭自动模式（同一事务）
+            conn.execute(
+                "UPDATE meta SET version = ?, status = 'done', auto_enabled = 0, "
+                "auto_deadline = NULL, auto_remaining = NULL WHERE id = 1",
+                (new_version,),
+            )
+        else:
+            # 每次只发一条：下一条从完整间隔重新计时，不补发积压
+            conn.execute(
+                "UPDATE meta SET version = ?, auto_deadline = ?, "
+                "auto_remaining = NULL WHERE id = 1",
+                (new_version, now + meta["auto_interval"]),
+            )
+        return True
+
+
+# 后台任务：周期唤醒执行 auto_tick，无需页面保持打开。测试可换可控时钟后
+# 直接调用 auto_tick 精确驱动；也可用 AUTO_WORKER=0 关闭后台线程。
+_auto_worker: Optional[threading.Thread] = None
+_auto_worker_stop = threading.Event()
+
+
+def _auto_worker_loop() -> None:
+    while not _auto_worker_stop.wait(AUTO_POLL_SECONDS):
+        try:
+            auto_tick()
+        except Exception:
+            # 后台任务失败不影响服务与页面：下一周期重试（写入失败已随
+            # 事务回滚，不会推进、重置计时或改版本）
+            pass
+
+
+def start_auto_worker() -> None:
+    global _auto_worker
+    if _auto_worker is not None and _auto_worker.is_alive():
+        return
+    _auto_worker_stop.clear()
+    _auto_worker = threading.Thread(
+        target=_auto_worker_loop, name="cue-auto-tick", daemon=True
+    )
+    _auto_worker.start()
+
+
+def stop_auto_worker() -> None:
+    global _auto_worker
+    _auto_worker_stop.set()
+    if _auto_worker is not None:
+        _auto_worker.join(timeout=2)
+        _auto_worker = None
+
+
 def issue_json(r: sqlite3.Row) -> dict:
     """一条现场问题记录；已发提示的 cue_content 取发出快照，不可再变。"""
     return {
@@ -269,7 +514,8 @@ def issue_rows(conn: sqlite3.Connection) -> list[dict]:
 def build_state(conn: sqlite3.Connection, token: Optional[str] = None) -> dict:
     meta = conn.execute(
         "SELECT version, status, paused, control_enabled, control_token, "
-        "verify_enabled, verify_round FROM meta WHERE id = 1"
+        "verify_enabled, verify_round, auto_enabled, auto_interval, "
+        "auto_deadline, auto_remaining FROM meta WHERE id = 1"
     ).fetchone()
     rows = conn.execute(
         "SELECT * FROM cues ORDER BY position ASC, id ASC"
@@ -292,6 +538,7 @@ def build_state(conn: sqlite3.Connection, token: Optional[str] = None) -> dict:
         }
 
     control_enabled = bool(meta["control_enabled"])
+    verify = verify_view(conn, meta, pending[0]["id"] if pending else None)
     return {
         "version": meta["version"],
         "status": meta["status"],
@@ -309,7 +556,9 @@ def build_state(conn: sqlite3.Connection, token: Optional[str] = None) -> dict:
         "issued": [issued_json(r) for r in issued],
         "issues": issue_rows(conn),
         # 本场核验：当前轮次与两工种就绪状态；关闭时为固定关闭视图
-        "verify": verify_view(conn, meta, pending[0]["id"] if pending else None),
+        "verify": verify,
+        # 自动发出：开关、间隔、剩余秒数或等待就绪；关闭时为固定关闭视图
+        "auto": auto_view(meta, verify["all_ready"]),
         "total": len(rows),
         "remaining": len(pending),
         "min_cues": MIN_CUES,
@@ -533,7 +782,13 @@ def compare_rows(base_view: dict[str, dict], compare_view: dict[str, dict]) -> l
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
+    with db() as conn:
+        # 服务重启关闭自动模式：开关与计时清空（间隔保留），下一场如需重开
+        auto_disable(conn)
+    if os.environ.get("AUTO_WORKER", "1") != "0":
+        start_auto_worker()
     yield
+    stop_auto_worker()
 
 
 app = FastAPI(title="舞台提示执行台", lifespan=lifespan)
@@ -594,6 +849,30 @@ class VerifyReportIn(BaseModel):
     cue_id: int      # 回报针对的当前提示 id
     round: int       # 页面所见的当前核验轮次
     ready: bool      # 就绪布尔值
+
+
+class AutoIn(BaseModel):
+    version: int
+    enabled: bool            # 目标开关：true 开启自动发出，false 关闭
+    interval: Optional[Any] = None  # 统一间隔（秒）：1～60 整数，缺省沿用已存间隔
+
+
+def auto_interval_error(interval: object) -> Optional[str]:
+    """校验自动间隔：1～60 的整数（布尔与带小数的数都不合法）。
+
+    通过返回 None，失败返回中文错误说明（接口据此返回 400，先于版本检查）。
+    """
+    if isinstance(interval, bool):
+        return f"自动间隔须为 {AUTO_MIN_INTERVAL}～{AUTO_MAX_INTERVAL} 秒的整数"
+    if isinstance(interval, int):
+        value = interval
+    elif isinstance(interval, float) and interval.is_integer():
+        value = int(interval)
+    else:
+        return f"自动间隔须为 {AUTO_MIN_INTERVAL}～{AUTO_MAX_INTERVAL} 秒的整数"
+    if not (AUTO_MIN_INTERVAL <= value <= AUTO_MAX_INTERVAL):
+        return f"自动间隔须为 {AUTO_MIN_INTERVAL}～{AUTO_MAX_INTERVAL} 秒的整数"
+    return None
 
 
 @app.get("/api/state")
@@ -715,6 +994,8 @@ def takeover_control(
             "UPDATE meta SET control_token = ?, version = version + 1 WHERE id = 1",
             (token,),
         )
+        # 接管即关闭自动模式（同一事务）：自动发出只随原控制席会话存在
+        auto_disable(conn)
         state = build_state(conn)
         state["control_token"] = token  # 凭据仅随成功的启用/接管响应返回
         state["control_granted"] = True  # 本响应的接收者即新控制席
@@ -811,6 +1092,59 @@ def verify_report(
         return build_state(conn, x_control_token)
 
 
+# ---------------------------------------------------------------- 自动发出
+
+@app.post("/api/auto")
+def set_auto(body: AutoIn, x_control_token: Optional[str] = Header(default=None)):
+    """设置自动发出：统一间隔（1～60 秒整数）与开关（仅演出中）。
+
+    携带页面版本号、受单控制席保护；成功版本 +1。开启或改间隔后从完整间隔
+    重新计时（暂停中则冻结完整间隔，恢复后续计）；已开启时仅改间隔同样
+    重计，开关与间隔都未变的调用不重置计时但仍推进版本。关闭后保留已设
+    间隔便于再次开启。非演出中或版本过期返回 409 及最新状态；间隔非法
+    返回 400（先于版本检查，不改数据）。"开启/关闭 + 间隔 + 计时 + 版本 +1"
+    在同一事务内落库，写入失败整体不变。
+    """
+    if body.interval is not None:
+        error = auto_interval_error(body.interval)
+        if error:
+            return bad_request(error)
+
+    with lock, db() as conn:
+        forbidden = control_check(conn, x_control_token)
+        if forbidden:
+            return forbidden
+        meta = conn.execute(
+            "SELECT version, status, paused, auto_enabled, auto_interval "
+            "FROM meta WHERE id = 1"
+        ).fetchone()
+        if meta["status"] != "live" or body.version != meta["version"]:
+            return conflict(conn, x_control_token)
+        new_interval = (
+            int(body.interval) if body.interval is not None
+            else meta["auto_interval"]
+        )
+        was_enabled = bool(meta["auto_enabled"])
+        if body.enabled:
+            restart = not was_enabled or new_interval != meta["auto_interval"]
+            conn.execute(
+                "UPDATE meta SET auto_enabled = 1, auto_interval = ?, "
+                "version = version + 1 WHERE id = 1",
+                (new_interval,),
+            )
+            if restart:
+                # 开启或改间隔：从完整间隔重新计时（暂停中冻结完整间隔）
+                auto_restart_timer(conn)
+        else:
+            conn.execute(
+                "UPDATE meta SET auto_enabled = 0, auto_interval = ?, "
+                "auto_deadline = NULL, auto_remaining = NULL, "
+                "version = version + 1 WHERE id = 1",
+                (new_interval,),
+            )
+        return build_state(conn, x_control_token)
+
+
 @app.post("/api/setup")
 def setup(body: SetupIn, x_control_token: Optional[str] = Header(default=None)):
     """开场前录入：2~12 条、编号唯一、内容非空。会清空旧进度。"""
@@ -840,6 +1174,8 @@ def setup(body: SetupIn, x_control_token: Optional[str] = Header(default=None)):
             "UPDATE meta SET version = version + 1, status = 'live', paused = 0 "
             "WHERE id = 1"
         )
+        # 演出中直接录入新场时自动模式保持开启：新场首条从完整间隔重新计时
+        auto_restart_timer(conn)
         return build_state(conn, x_control_token)
 
 
@@ -895,10 +1231,20 @@ def confirm(body: VersionedIn, x_control_token: Optional[str] = Header(default=N
         ).fetchone()["c"]
         # 确认推进：开启新轮次并清空本轮就绪（同一事务，轮次不可复用）
         verify_advance(conn)
-        conn.execute(
-            "UPDATE meta SET version = ?, status = ? WHERE id = 1",
-            (new_version, "done" if remaining == 0 else "live"),
-        )
+        if remaining == 0:
+            # 全部发出：完成并关闭自动模式（同一事务）
+            auto_disable(conn)
+            conn.execute(
+                "UPDATE meta SET version = ?, status = 'done' WHERE id = 1",
+                (new_version,),
+            )
+        else:
+            # 手工确认更换了当前提示：自动计时从完整间隔重新计起（同一事务）
+            auto_restart_timer(conn)
+            conn.execute(
+                "UPDATE meta SET version = ?, status = 'live' WHERE id = 1",
+                (new_version,),
+            )
         return build_state(conn, x_control_token)
 
 
@@ -965,6 +1311,9 @@ def withdraw(body: WithdrawIn, x_control_token: Optional[str] = Header(default=N
         # 与确认同版本竞争时只有一个生效——撤回先完成则确认因版本过期失败，
         # 确认先完成则本撤回因版本过期被拒，双方都不会复用旧轮次。
         verify_advance(conn)
+        # 撤回更换了当前提示：自动计时从完整间隔重新计起（同一事务；
+        # 暂停中则冻结完整间隔，恢复后续计）
+        auto_restart_timer(conn)
         # 完成态退回一条即回到演出中；暂停标记不动。
         conn.execute(
             "UPDATE meta SET version = version + 1, status = 'live' WHERE id = 1"
@@ -999,6 +1348,11 @@ def pause(body: PauseIn, x_control_token: Optional[str] = Header(default=None)):
             "UPDATE meta SET paused = ?, version = version + 1 WHERE id = 1",
             (1 if body.paused else 0,),
         )
+        # 暂停冻结自动计时的剩余时间，恢复按剩余时间续计（同一事务）
+        if body.paused:
+            auto_freeze(conn)
+        else:
+            auto_thaw(conn)
         return build_state(conn, x_control_token)
 
 
@@ -1040,6 +1394,8 @@ def edit(body: EditIn, x_control_token: Optional[str] = Header(default=None)):
         ).fetchone()
         if first is not None and first["id"] == row["id"]:
             verify_advance(conn)
+            # 改写当前提示：自动计时从完整间隔重新计起（编辑其他提示不重置）
+            auto_restart_timer(conn)
         conn.execute("UPDATE meta SET version = version + 1 WHERE id = 1")
         return build_state(conn, x_control_token)
 
@@ -1078,6 +1434,8 @@ def reorder(body: ReorderIn, x_control_token: Optional[str] = Header(default=Non
         new_head = body.order[0] if body.order else None
         if old_head != new_head:
             verify_advance(conn)
+            # 换队首：自动计时从完整间隔重新计起（队首不变的重排不重置）
+            auto_restart_timer(conn)
         conn.execute("UPDATE meta SET version = version + 1 WHERE id = 1")
         return build_state(conn, x_control_token)
 
@@ -1151,6 +1509,7 @@ def reset(x_control_token: Optional[str] = Header(default=None)):
         conn.execute("DELETE FROM cues")
         conn.execute("DELETE FROM issues")  # 重置一并清空当前场问题记录
         verify_close(conn)  # 重置关闭本场核验并清空轮次与就绪，下一场不继承
+        auto_disable(conn)  # 重置关闭自动模式并清空计时（间隔保留）
         conn.execute(
             "UPDATE meta SET version = version + 1, status = 'setup', paused = 0 "
             "WHERE id = 1"
@@ -1201,6 +1560,7 @@ def archive(body: ArchiveIn, x_control_token: Optional[str] = Header(default=Non
         # 归档关闭本场核验并清空轮次与就绪（不写入档案，档案结构不变），
         # 下一场不继承；与"写档案 + 清空"在同一事务内提交。
         verify_close(conn)
+        auto_disable(conn)  # 归档关闭自动模式并清空计时（同一事务）
         conn.execute(
             "UPDATE meta SET version = ?, status = 'setup', paused = 0 WHERE id = 1",
             (new_version,),
@@ -1261,6 +1621,8 @@ def start_from_archive(
             "UPDATE meta SET version = version + 1, status = 'live', paused = 0 "
             "WHERE id = 1"
         )
+        # 防御：开场前自动模式本已关闭（归档/重置/重启都会关闭），此调用为无操作
+        auto_restart_timer(conn)
         return build_state(conn, x_control_token)
 
 
