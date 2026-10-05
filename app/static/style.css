@@ -326,6 +326,18 @@ button.small { padding: 3px 10px; font-size: 12px; }
 .verify-ok { color: var(--green); font-size: 13px; }
 .verify-wait { color: var(--muted); font-size: 13px; }
 
+/* ---------- 自动发出 ---------- */
+.auto-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin: 4px 0 10px;
+}
+.auto-interval-label, .auto-unit { color: var(--muted); font-size: 13px; }
+#auto-interval { width: 84px; padding: 6px 10px; font-size: 14px; }
+.auto-status { font-size: 13px; color: var(--muted); }
+
 .issue-edit {
   display: flex;
   align-items: center;

@@ -55,6 +55,17 @@
         <div id="current-card" class="card"></div>
         <div id="next-card" class="card muted"></div>
         <div id="verify-card" class="card hidden"></div>
+        <div id="auto-card" class="card">
+          <div class="card-label" id="auto-label">自动发出 · 未开启</div>
+          <div class="auto-row">
+            <label class="auto-interval-label" for="auto-interval">间隔</label>
+            <input id="auto-interval" type="number" min="1" max="60" step="1" value="10">
+            <span class="auto-unit">秒</span>
+            <button id="auto-toggle" class="small primary">开启自动</button>
+            <button id="auto-apply" class="small hidden">应用间隔</button>
+          </div>
+          <div id="auto-status" class="auto-status"></div>
+        </div>
 
         <h3>待发出 <span class="hint-inline">（可改写、可重排）</span></h3>
         <ul id="pending-list" class="cue-list"></ul>

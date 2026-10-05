@@ -180,6 +180,13 @@ function updateBusy() {
   // 不随控制资格禁用，由 updateVerifyButtons 按演出状态与在途请求管理
   const verifyEnableBtn = $("#verify-enable-btn");
   if (verifyEnableBtn) verifyEnableBtn.disabled = busy || !writable;
+  // 自动发出的开关 / 应用 / 间隔输入：仅演出中且本页可写时可用
+  const autoToggle = $("#auto-toggle");
+  if (autoToggle) autoToggle.disabled = busy || !writable || !state || state.status !== "live";
+  const autoApply = $("#auto-apply");
+  if (autoApply) autoApply.disabled = busy || !writable || !state || state.status !== "live";
+  const autoInterval = $("#auto-interval");
+  if (autoInterval) autoInterval.disabled = busy || !writable || !state || state.status !== "live";
   // 演出页的回报按钮：请求在途禁用（防重复回报），结束后按最新状态恢复；
   // 不随控制资格禁用（回报无需凭据）。开场 /api/setup 成功后 renderVerify
   // 在 busy 仍为 true 时渲染，全靠这里把按钮恢复为可点。
@@ -801,12 +808,113 @@ function reportVerify(dept) {
   });
 }
 
+/* ---------------------------------------------------------------- 自动发出
+ * 默认关闭。演出中可设置统一间隔（1～60 秒整数）并开启：服务端后台任务在
+ * 当前提示等满间隔、未暂停且核验门槛（两工种就绪）满足时自动发出一条，
+ * 无需页面保持打开。页面只负责设置与展示：开启后每秒轮询一次状态，同步
+ * 剩余秒数 / 等待就绪 / 暂停冻结，以及服务端自动发出后的最新进度。
+ * 暂停冻结、恢复续计；手工确认 / 撤回 / 改写当前提示 / 换队首后服务端从
+ * 完整间隔重新计时；接管、归档、重置、完成或服务重启都会关闭自动模式。 */
+
+/* 服务端状态中的自动发出视图；旧服务端/异常响应缺该字段时按未开启处理。 */
+function autoState() {
+  const a = state && state.auto;
+  return a && typeof a === "object"
+    ? a
+    : { enabled: false, interval: 10, remaining_seconds: null, waiting_ready: false };
+}
+
+let autoPollTimer = null; // 自动开启且演出中时的每秒轮询（同步倒计时与进度）
+let lastAutoInterval = null; // 上次渲染写入间隔输入框的值（避免轮询覆盖输入中内容）
+
+/* 自动开启且演出中时每秒轮询状态；其余情况（关闭、收场、开场前）停止轮询。 */
+function syncAutoPolling() {
+  const want = !!state && state.status === "live" && autoState().enabled;
+  if (want && autoPollTimer === null) {
+    autoPollTimer = setInterval(pollState, 1000);
+  } else if (!want && autoPollTimer !== null) {
+    clearInterval(autoPollTimer);
+    autoPollTimer = null;
+  }
+}
+
+/* 轮询当前状态：自动发出由服务端后台执行，页面借此同步进度；失败静默，
+ * 下一拍重试。凭据随请求提交核验，被接管后本页随之转为只读。 */
+async function pollState() {
+  try {
+    const headers = {};
+    if (controlToken) headers["X-Control-Token"] = controlToken;
+    const res = await fetch("/api/state", { headers });
+    if (!res.ok) return;
+    applyState(await res.json());
+  } catch (err) { /* 网络波动：下一拍重试 */ }
+}
+
+function fmtAutoRemaining(a) {
+  const r = a.remaining_seconds;
+  return r === null || r === undefined ? null : Math.max(0, Math.ceil(r));
+}
+
+/* 演出页的自动发出卡片：开关、间隔设置与倒计时 / 等待就绪 / 暂停冻结显示。
+ * 间隔输入框只在服务端间隔变化时重写，避免每秒轮询覆盖正在输入的内容。 */
+function renderAuto() {
+  const label = $("#auto-label");
+  const statusEl = $("#auto-status");
+  const toggle = $("#auto-toggle");
+  const apply = $("#auto-apply");
+  if (!label || !statusEl || !toggle || !apply) return;
+  const a = autoState();
+  const input = $("#auto-interval");
+  if (input && lastAutoInterval !== a.interval) {
+    input.value = a.interval;
+    lastAutoInterval = a.interval;
+  }
+  label.textContent = a.enabled
+    ? `自动发出 · 已开启（每 ${a.interval} 秒）`
+    : "自动发出 · 未开启";
+  toggle.textContent = a.enabled ? "关闭自动" : "开启自动";
+  toggle.classList.toggle("warning-outline", a.enabled);
+  toggle.classList.toggle("primary", !a.enabled);
+  apply.classList.toggle("hidden", !a.enabled);
+  const remaining = fmtAutoRemaining(a);
+  let msg;
+  if (!a.enabled) {
+    msg = "开启后当前提示等满间隔即自动发出；暂停冻结，两工种就绪门槛同样生效";
+  } else if (state.paused) {
+    msg = `已暂停 · 恢复后继续计时（剩余约 ${remaining === null ? "…" : remaining} 秒）`;
+  } else if (a.waiting_ready) {
+    msg = "已到期 · 待灯光、音响报就绪后自动发出";
+  } else if (remaining === null) {
+    msg = "计时中…";
+  } else if (remaining <= 0) {
+    msg = "即将自动发出…";
+  } else {
+    msg = `约 ${remaining} 秒后自动发出当前提示`;
+  }
+  statusEl.textContent = msg;
+}
+
+/* 设置自动发出（开启 / 关闭 / 改间隔）：携带页面版本号，受控制席保护；
+ * 间隔非法时只在页面提示（服务端同样返回 400）；409 / 403 由 api() 统一处理。 */
+function submitAuto(enabled) {
+  if (!state || state.status !== "live" || busy || !canWrite()) return;
+  const input = $("#auto-interval");
+  const interval = Number(input ? input.value : NaN);
+  if (!Number.isInteger(interval) || interval < 1 || interval > 60) {
+    toast("自动发出间隔须为 1～60 秒的整数");
+    if (input && input.focus) input.focus();
+    return;
+  }
+  api("/api/auto", { version: state.version, enabled, interval });
+}
+
 /* ---------------------------------------------------------------- 渲染 */
 
 function render() {
   if (!state) return;
   $("#version-badge").textContent = "v" + state.version;
   renderControl(); // 刷新或收到 403 后都会走到这里，标记随之更新
+  syncAutoPolling(); // 自动开启且演出中时每秒轮询，同步倒计时与自动发出进度
 
   const inSetup = state.status === "setup";
   $("#setup-view").classList.toggle("hidden", !inSetup);
@@ -859,6 +967,7 @@ function render() {
   renderIssued();
   renderIssues();
   renderVerify(); // 核验卡片：当前轮次与两工种就绪状态
+  renderAuto();   // 自动发出卡片：开关、间隔与倒计时 / 等待就绪
   updateBusy();
 }
 
@@ -1106,6 +1215,15 @@ $("#pause-btn").addEventListener("click", () => {
   if (!state || state.status !== "live") return;
   // 提交目标暂停状态与页面所见版本号；同版本的其他操作先生效时会拿到 409
   api("/api/pause", { version: state.version, paused: !state.paused });
+});
+
+/* 自动发出开关与间隔设置（仅演出中）：携带页面版本号，受控制席保护；
+ * 开启或改间隔后服务端从完整间隔重新计时。 */
+$("#auto-toggle").addEventListener("click", () => {
+  submitAuto(!autoState().enabled);
+});
+$("#auto-apply").addEventListener("click", () => {
+  submitAuto(true);
 });
 
 /* 撤回末条已发提示（误点确认后补救）：二次确认后提交页面所见的末条已发
